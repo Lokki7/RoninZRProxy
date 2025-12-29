@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "nikon_bt.cpp"
         "pmu_axp2101.c"
         "lcd_st7789.c"
         "font5x7.c"
@@ -17,7 +18,7 @@ idf_component_register(
         "usb_ptp_proxy.c"
         "ptp_proxy_server.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_psram esp_lcd driver esp_wifi esp_event esp_netif nvs_flash esp_https_ota esp_http_client esp-tls app_update mbedtls espressif__esp_tinyusb espressif__tinyusb
+    REQUIRES esp_psram esp_lcd driver esp_wifi esp_event esp_netif nvs_flash bt esp_https_ota esp_http_client esp-tls app_update mbedtls espressif__esp_tinyusb espressif__tinyusb
     PRIV_REQUIRES spi_flash esp_timer
 )
 

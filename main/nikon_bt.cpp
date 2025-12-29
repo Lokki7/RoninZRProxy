@@ -54,6 +54,11 @@ static const ble_uuid128_t kNikonServiceUuid =
 // Nikon manufacturer company ID (from furble).
 static constexpr uint16_t kNikonCompanyId = 0x0399;
 
+// Auto reconnect policy (default: disabled).
+// This controls the background reconnect loop after disconnect/connect failure/scan timeout.
+// Initial connect at boot still happens regardless of this flag.
+static constexpr bool kBtAutoReconnectEnabled = false;
+
 // Nikon characteristic UUIDs (remote mode).
 static const ble_uuid128_t kNikonChrPairRemoteUuid =
     BLE_UUID128_INIT(0x61, 0x55, 0xbd, 0xb9, 0xc7, 0x6d, 0x62, 0x8d,
@@ -78,8 +83,10 @@ static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static ble_addr_t s_last_peer{};
 static bool s_have_last_peer = false;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static int s_last_connect_status = 0;  // -1 while connect attempt in progress
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static uint32_t s_backoff_ms = 1000;
+static bool s_fast_connect_attempt = false;
 
 static ble_addr_t s_scan_candidate{};
 static bool s_scan_have_candidate = false;
@@ -254,15 +261,38 @@ static void schedule_reconnect(uint32_t delay_ms);
 static void stop_reconnect(void);
 static void start_scan_for_nikon(uint32_t duration_ms);
 static int connect_peer(const ble_addr_t &peer);
+static int connect_peer_timeout(const ble_addr_t &peer, uint32_t timeout_ms);
 static void nikon_bt_task(void *arg);
 static bool gatt_discover_all(uint16_t conn_handle);
 static bool nikon_remote_pair(uint16_t conn_handle);
 static bool nikon_remote_session_init(uint16_t conn_handle);
 static bool nikon_shutter_click(uint16_t conn_handle);
 static bool gatt_exchange_mtu(uint16_t conn_handle);
-static void bt_security_start(uint16_t conn_handle);
+static int bt_security_start(uint16_t conn_handle);
 static bool gatt_wait(uint32_t timeout_ms, const char *what);
 static bool bt_wait_encryption(uint32_t timeout_ms);
+
+static void gatt_sem_drain(void)
+{
+    if (s_gatt_sem == nullptr) return;
+    while (xSemaphoreTake(s_gatt_sem, 0) == pdTRUE) {}
+}
+
+static bool conn_is_encrypted(uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) {
+        return false;
+    }
+    return desc.sec_state.encrypted != 0;
+}
+
+static bool gatt_rc_requires_encryption(int rc)
+{
+    return (rc == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_ENC)) ||
+           (rc == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_AUTHEN)) ||
+           (rc == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_AUTHOR));
+}
 
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
@@ -271,12 +301,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT: {
         if (event->connect.status == 0) {
+            s_last_connect_status = 0;
             s_conn_handle = event->connect.conn_handle;
             s_backoff_ms = 1000;
+            s_fast_connect_attempt = false;
             s_remote_session_ready = false;
             ESP_LOGI(TAG, "connected (handle=%u)", s_conn_handle);
             bt_tcp_logf("[BT] connected handle=%u\r\n", s_conn_handle);
             ui_bt_line("BT: connected");
+            stop_reconnect();
 
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(s_conn_handle, &desc) == 0) {
@@ -297,11 +330,19 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         } else {
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            const bool was_fast = s_fast_connect_attempt;
+            s_fast_connect_attempt = false;
+            s_last_connect_status = event->connect.status;
             ESP_LOGW(TAG, "connect failed: status=%d", event->connect.status);
             bt_tcp_logf("[BT] connect failed status=%d\r\n", event->connect.status);
             ui_bt_line("BT: connect failed");
-            schedule_reconnect(s_backoff_ms);
-            s_backoff_ms = (s_backoff_ms < 30000) ? (s_backoff_ms * 2) : 30000;
+            if (was_fast) {
+                bt_tcp_logf("[BT] fast connect failed -> scan\r\n");
+                start_scan_for_nikon(30000);
+            } else {
+                schedule_reconnect(s_backoff_ms);
+                s_backoff_ms = (s_backoff_ms < 30000) ? (s_backoff_ms * 2) : 30000;
+            }
         }
         return 0;
     }
@@ -311,6 +352,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_pairing_in_progress = false;
         s_remote_session_ready = false;
+        s_fast_connect_attempt = false;
         ui_bt_line("BT: disconnected");
         schedule_reconnect(s_backoff_ms);
         s_backoff_ms = (s_backoff_ms < 30000) ? (s_backoff_ms * 2) : 30000;
@@ -438,6 +480,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
 static int connect_peer(const ble_addr_t &peer)
 {
+    return connect_peer_timeout(peer, 30000 /*ms*/);
+}
+
+static int connect_peer_timeout(const ble_addr_t &peer, uint32_t timeout_ms)
+{
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGI(TAG, "already connected (handle=%u)", s_conn_handle);
         bt_tcp_logf("[BT] already connected handle=%u\r\n", s_conn_handle);
@@ -459,7 +506,7 @@ static int connect_peer(const ble_addr_t &peer)
     params.max_ce_len = 0;
 
     log_addr("connecting to: ", peer);
-    int rc = ble_gap_connect(s_own_addr_type, &peer, 30000 /*ms*/, &params, gap_event, nullptr);
+    int rc = ble_gap_connect(s_own_addr_type, &peer, (int32_t)timeout_ms, &params, gap_event, nullptr);
     if (rc != 0) {
         ESP_LOGW(TAG, "ble_gap_connect rc=%d", rc);
         bt_tcp_logf("[BT] ble_gap_connect rc=%d\r\n", rc);
@@ -467,11 +514,34 @@ static int connect_peer(const ble_addr_t &peer)
     return rc;
 }
 
+static bool fast_connect_last_peer(uint32_t timeout_ms)
+{
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return false;
+    if (s_mode_pairing) return false;
+    if (!s_have_last_peer) return false;
+
+    bt_tcp_logf("[BT] fast connect last peer timeout=%" PRIu32 "ms\r\n", timeout_ms);
+    s_fast_connect_attempt = true;
+    s_last_connect_status = -1;
+    int rc = connect_peer_timeout(s_last_peer, timeout_ms);
+    if (rc != 0) {
+        s_fast_connect_attempt = false;
+        return false;
+    }
+    return true;
+}
+
 static void reconnect_timer_cb(void *arg)
 {
     (void)arg;
 
-    // Prefer scanning: Nikon cameras may use rotating private addresses.
+    // Fast path: try direct connect to last peer first (no scan). If it fails, fall back to scan.
+    // Note: Nikon connect establishment often takes ~5s; give it some margin to avoid failing on the timeout edge.
+    if (fast_connect_last_peer(9000)) {
+        return;
+    }
+
+    // Fallback: Nikon cameras may use rotating private addresses.
     start_scan_for_nikon(30000);
 }
 
@@ -484,6 +554,10 @@ static void stop_reconnect(void)
 
 static void schedule_reconnect(uint32_t delay_ms)
 {
+    if (!kBtAutoReconnectEnabled) {
+        bt_tcp_logf("[BT] reconnect suppressed (auto disabled)\r\n");
+        return;
+    }
     if (s_reconnect_timer == nullptr) {
         const esp_timer_create_args_t args = {
             .callback = &reconnect_timer_cb,
@@ -569,7 +643,9 @@ static void on_sync(void)
             bt_tcp_logf("[BT] last device_id_le=0x%08" PRIx32 "\r\n", s_pref_device_id_le);
         }
     }
-    start_scan_for_nikon(30000);
+    if (!fast_connect_last_peer(9000)) {
+        start_scan_for_nikon(30000);
+    }
 }
 
 static void on_reset(int reason)
@@ -784,6 +860,7 @@ static int on_read(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static bool gatt_read_pair(uint16_t conn_handle, uint32_t timeout_ms)
 {
+    gatt_sem_drain();
     s_gatt_rc = 0;
     int rc = ble_gattc_read(conn_handle, s_pair_val_handle, on_read, nullptr);
     if (rc != 0) {
@@ -811,6 +888,7 @@ static int on_mtu(uint16_t conn_handle, const struct ble_gatt_error *error, uint
 
 static bool gatt_exchange_mtu(uint16_t conn_handle)
 {
+    gatt_sem_drain();
     s_gatt_rc = 0;
     int rc = ble_gattc_exchange_mtu(conn_handle, on_mtu, nullptr);
     if (rc == BLE_HS_EALREADY) {
@@ -825,7 +903,7 @@ static bool gatt_exchange_mtu(uint16_t conn_handle)
     return gatt_wait(3000, "mtu");
 }
 
-static void bt_security_start(uint16_t conn_handle)
+static int bt_security_start(uint16_t conn_handle)
 {
     // Best-effort; some cameras require encryption/bonding before sending indications.
     s_last_enc_status = -1;
@@ -841,6 +919,7 @@ static void bt_security_start(uint16_t conn_handle)
                     (int)CONFIG_BT_NIMBLE_SM_SC);
         bt_tcp_logf("[BT] if these are 1, then ENOTSUP is coming from host state (e.g. not synced) or API usage.\r\n");
     }
+    return rc;
 }
 
 static bool bt_wait_encryption(uint32_t timeout_ms)
@@ -859,10 +938,12 @@ static bool gatt_wait(uint32_t timeout_ms, const char *what)
     if (s_gatt_sem == nullptr) return false;
     if (xSemaphoreTake(s_gatt_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         ESP_LOGW(TAG, "%s: timeout", what);
+        bt_tcp_logf("[BT] %s: timeout\r\n", what);
         return false;
     }
     if (s_gatt_rc != 0) {
         ESP_LOGW(TAG, "%s: rc=%d", what, s_gatt_rc);
+        bt_tcp_logf("[BT] %s: rc=%d\r\n", what, s_gatt_rc);
         return false;
     }
     return true;
@@ -881,24 +962,29 @@ static bool gatt_discover_all(uint16_t conn_handle)
     s_chrs_len = 0;
 
     // Discover Nikon service.
+    gatt_sem_drain();
     s_gatt_rc = 0;
     int rc = ble_gattc_disc_svc_by_uuid(conn_handle, (const ble_uuid_t *)&kNikonServiceUuid,
                                         on_disc_svc, nullptr);
     if (rc != 0) {
         ESP_LOGW(TAG, "disc_svc rc=%d", rc);
+        bt_tcp_logf("[BT] disc_svc start rc=%d\r\n", rc);
         return false;
     }
     if (!gatt_wait(5000, "disc_svc")) return false;
     if (s_svc_start == 0 || s_svc_end == 0) {
         ESP_LOGW(TAG, "nikon service not found");
+        bt_tcp_logf("[BT] nikon service not found\r\n");
         return false;
     }
 
     // Discover all characteristics to compute correct descriptor ranges per characteristic.
+    gatt_sem_drain();
     s_gatt_rc = 0;
     rc = ble_gattc_disc_all_chrs(conn_handle, s_svc_start, s_svc_end, on_disc_all_chrs, nullptr);
     if (rc != 0) {
         ESP_LOGW(TAG, "disc_all_chrs rc=%d", rc);
+        bt_tcp_logf("[BT] disc_all_chrs start rc=%d\r\n", rc);
         return false;
     }
     if (!gatt_wait(5000, "disc_all_chrs")) return false;
@@ -921,32 +1007,39 @@ static bool gatt_discover_all(uint16_t conn_handle)
 
     if (s_pair_val_handle == 0 || s_pair_end_handle == 0) {
         ESP_LOGW(TAG, "pair characteristic not found");
+        bt_tcp_logf("[BT] pair characteristic not found\r\n");
         return false;
     }
     if (s_shutter_val_handle == 0 || s_shutter_end_handle == 0) {
         ESP_LOGW(TAG, "shutter characteristic not found");
+        bt_tcp_logf("[BT] shutter characteristic not found\r\n");
         return false;
     }
 
     // Discover CCCD for pairing characteristic (search until end of service).
+    gatt_sem_drain();
     s_gatt_rc = 0;
     rc = ble_gattc_disc_all_dscs(conn_handle, s_pair_val_handle, s_pair_end_handle, on_disc_dsc, (void *)"pair");
     if (rc != 0) {
         ESP_LOGW(TAG, "disc_dsc rc=%d", rc);
+        bt_tcp_logf("[BT] disc_dsc(pair) start rc=%d\r\n", rc);
         return false;
     }
     if (!gatt_wait(5000, "disc_dsc")) return false;
     if (s_pair_cccd_handle == 0) {
         ESP_LOGW(TAG, "pair CCCD not found");
+        bt_tcp_logf("[BT] pair CCCD not found\r\n");
         return false;
     }
 
     // Discover CCCD for ind1 characteristic, if present.
     if (s_ind1_val_handle != 0 && s_ind1_end_handle != 0) {
+        gatt_sem_drain();
         s_gatt_rc = 0;
         rc = ble_gattc_disc_all_dscs(conn_handle, s_ind1_val_handle, s_ind1_end_handle, on_disc_dsc, (void *)"ind1");
         if (rc != 0) {
             ESP_LOGW(TAG, "disc_dsc(ind1) rc=%d", rc);
+            bt_tcp_logf("[BT] disc_dsc(ind1) start rc=%d\r\n", rc);
             return false;
         }
         if (!gatt_wait(5000, "disc_dsc(ind1)")) return false;
@@ -962,10 +1055,12 @@ static bool gatt_discover_all(uint16_t conn_handle)
 static bool gatt_write_flat(uint16_t conn_handle, uint16_t handle, const void *data, uint16_t len,
                             uint32_t timeout_ms, const char *what)
 {
+    gatt_sem_drain();
     s_gatt_rc = 0;
     int rc = ble_gattc_write_flat(conn_handle, handle, data, len, on_write, nullptr);
     if (rc != 0) {
         ESP_LOGW(TAG, "%s: write_flat rc=%d", what, rc);
+        bt_tcp_logf("[BT] %s: write_flat start rc=%d\r\n", what, rc);
         return false;
     }
     return gatt_wait(timeout_ms, what);
@@ -983,9 +1078,52 @@ static bool nikon_remote_handshake(uint16_t conn_handle, const char *what, bool 
     ui_bt_line(persist_ids ? "BT: pairing..." : "BT: session...");
     bt_tcp_logf("[BT] %s start\r\n", what);
 
+    // Security:
+    // - Pairing: do security early and wait (user expects pairing to take time).
+    // - Session / reconnect: do NOT proactively start security (it can fail later and cause camera to drop the link).
+    //   If a specific GATT op requires encryption, we'll trigger security on-demand and retry.
+    if (persist_ids) {
+        if (conn_is_encrypted(conn_handle)) {
+            bt_tcp_logf("[BT] %s: link already encrypted\r\n", what);
+        } else {
+            const int sec_rc = bt_security_start(conn_handle);
+            if (sec_rc == 0) {
+                (void)bt_wait_encryption(6000);
+            } else {
+                bt_tcp_logf("[BT] %s: skip enc_wait (sec_rc=%d)\r\n", what, sec_rc);
+            }
+        }
+    } else {
+        if (conn_is_encrypted(conn_handle)) {
+            bt_tcp_logf("[BT] %s: link already encrypted\r\n", what);
+        } else {
+            bt_tcp_logf("[BT] %s: security not initiated (fast session)\r\n", what);
+        }
+    }
+
     (void)gatt_exchange_mtu(conn_handle);
 
-    if (!gatt_discover_all(conn_handle)) {
+    // After wake/reconnect the camera may need extra time before its GATT DB responds.
+    bool gatt_ok = false;
+    uint32_t backoff_ms = 500;
+    for (int attempt = 0; attempt < 6; attempt++) {
+        if (conn_handle == BLE_HS_CONN_HANDLE_NONE || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            break;
+        }
+        if (attempt == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            bt_tcp_logf("[BT] %s: gatt retry #%d in %" PRIu32 " ms\r\n", what, attempt, backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            if (backoff_ms < 8000) backoff_ms *= 2;
+        }
+        if (gatt_discover_all(conn_handle)) {
+            gatt_ok = true;
+            break;
+        }
+    }
+
+    if (!gatt_ok) {
         ui_bt_line("BT: fail (gatt)");
         bt_tcp_logf("[BT] %s failed: gatt discovery\r\n", what);
         s_pairing_in_progress = false;
@@ -996,11 +1134,24 @@ static bool nikon_remote_handshake(uint16_t conn_handle, const char *what, bool 
     const uint8_t cccd_indicate[2] = {0x02, 0x00};
     if (!gatt_write_flat(conn_handle, s_pair_cccd_handle, cccd_indicate, sizeof(cccd_indicate),
                          5000, "cccd(pair)")) {
+        // If camera requires encryption for CCCD writes, enable security on-demand and retry once.
+        if (!conn_is_encrypted(conn_handle) && gatt_rc_requires_encryption(s_gatt_rc)) {
+            bt_tcp_logf("[BT] %s: cccd(pair) requires encryption rc=%d -> security+retry\r\n", what, s_gatt_rc);
+            const int sec_rc = bt_security_start(conn_handle);
+            if (sec_rc == 0) {
+                (void)bt_wait_encryption(persist_ids ? 6000 : 2000);
+            }
+            if (gatt_write_flat(conn_handle, s_pair_cccd_handle, cccd_indicate, sizeof(cccd_indicate),
+                                5000, "cccd(pair)")) {
+                goto cccd_pair_ok;
+            }
+        }
         ui_bt_line("BT: fail (cccd)");
         bt_tcp_logf("[BT] %s failed: enable indications\r\n", what);
         s_pairing_in_progress = false;
         return false;
     }
+cccd_pair_ok:
     bt_tcp_logf("[BT] cccd(pair)=ok handle=%u\r\n", (unsigned)s_pair_cccd_handle);
     if (s_ind1_cccd_handle != 0) {
         if (gatt_write_flat(conn_handle, s_ind1_cccd_handle, cccd_indicate, sizeof(cccd_indicate),
@@ -1181,9 +1332,32 @@ static bool nikon_remote_session_init(uint16_t conn_handle)
 static bool nikon_shutter_click(uint16_t conn_handle)
 {
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        ui_bt_line("BT: not connected");
-        bt_tcp_logf("[BT] shutter: not connected\r\n");
-        return false;
+        bt_tcp_logf("[BT] shutter: not connected -> fast reconnect\r\n");
+        ui_bt_line("BT: connecting...");
+
+        // Important: we're in the BT app task. Don't use scan->CMD_CONNECT_CANDIDATE here,
+        // or we'd block the processing of that command. For shutter we do fast connect only.
+        if (!fast_connect_last_peer(9000)) {
+            ui_bt_line("BT: not connected");
+            bt_tcp_logf("[BT] shutter: fast reconnect not possible (no last peer?)\r\n");
+            return false;
+        }
+
+        // Wait for connect completion (or failure) without requiring app-task message processing.
+        const uint32_t timeout_ms = 10000;
+        uint32_t waited = 0;
+        while (waited < timeout_ms) {
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) break;
+            if (s_last_connect_status != -1) break;  // connect attempt finished (failed)
+            vTaskDelay(pdMS_TO_TICKS(50));
+            waited += 50;
+        }
+        conn_handle = s_conn_handle;
+        if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            ui_bt_line("BT: not connected");
+            bt_tcp_logf("[BT] shutter: reconnect failed/timeout status=%d\r\n", s_last_connect_status);
+            return false;
+        }
     }
     if (s_shutter_val_handle == 0) {
         // Lazy discovery if needed.

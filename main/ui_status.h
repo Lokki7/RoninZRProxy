@@ -5,6 +5,10 @@
 #include "tcp_server.h"
 #include "ota_update.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Start UI status task and begin rendering Wi-Fi status on LCD.
  */
@@ -48,5 +52,14 @@ esp_err_t rs3_ui_status_ptp_impl(const char *impl);
  * @brief Update recording indicator on the LCD (non-blocking).
  */
 esp_err_t rs3_ui_status_set_rec(bool rec_on);
+
+/**
+ * @brief Set Bluetooth status line on the LCD (non-blocking).
+ */
+esp_err_t rs3_ui_status_bt_line(const char *line);
+
+#ifdef __cplusplus
+}
+#endif
 
 

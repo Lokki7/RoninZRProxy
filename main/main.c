@@ -14,6 +14,8 @@
 #include "usb_ptp_cam.h"
 #include "ptp_proxy_server.h"
 #include "rec_events.h"
+#include "nikon_bt.h"
+#include "log_tcp.h"
 
 #include "esp_chip_info.h"
 #include "esp_flash.h"
@@ -32,6 +34,19 @@ static void rec_ui_cb(const rs3_rec_event_t *ev, void *ctx)
 {
     (void)ctx;
     (void)rs3_ui_status_set_rec(ev->recording);
+}
+
+static void rec_bt_cb(const rs3_rec_event_t *ev, void *ctx)
+{
+    (void)ctx;
+    if (!ev) return;
+    // Trigger Nikon shutter on each RS3 REC button full-press (PTP 0x9207).
+    // RS3 sends alternating START/STOP events; we want a shutter click on both.
+    if (ev->kind == RS3_REC_EVT_START || ev->kind == RS3_REC_EVT_STOP) {
+        rs3_tcp_logf("[REC] %s -> BT shutter\r\n",
+                     (ev->kind == RS3_REC_EVT_START) ? "start" : "stop");
+        (void)rs3_nikon_bt_shutter_click();
+    }
 }
 
 void app_main(void)
@@ -90,6 +105,12 @@ void app_main(void)
     ESP_ERROR_CHECK(rs3_rec_events_start());
     // UI subscriber: show REC: ON/OFF. (Bluetooth can subscribe later as well.)
     ESP_ERROR_CHECK(rs3_rec_events_subscribe(rec_ui_cb, NULL));
+    ESP_ERROR_CHECK(rs3_rec_events_subscribe(rec_bt_cb, NULL));
+
+    // ---- Nikon Bluetooth ----
+    // Starts NimBLE. Connection to the camera happens on-demand (Pair / Shutter / PTP REC).
+    // If Bluetooth is disabled in sdkconfig, this is a no-op with a warning.
+    (void)rs3_nikon_bt_start();
 
     // ---- USB PTP camera emulation ----
     ESP_ERROR_CHECK(rs3_usb_ptp_cam_start());

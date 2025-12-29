@@ -13,8 +13,10 @@
 
 #include "font5x7.h"
 #include "lcd_st7789.h"
+#include "log_tcp.h"
 #include "ota_update.h"
 #include "touch_cst816.h"
+#include "nikon_bt.h"
 
 #include "esp_system.h"
 
@@ -29,6 +31,7 @@ typedef enum {
     UI_MSG_PTP_IMPL,
     UI_MSG_PTP_LINE,
     UI_MSG_REC,
+    UI_MSG_BT_LINE,
 } ui_msg_kind_t;
 
 typedef struct {
@@ -39,6 +42,7 @@ typedef struct {
         rs3_ota_status_t ota;
         char ptp_impl[PTP_UI_LINE_MAX];
         char ptp_line[PTP_UI_LINE_MAX];
+        char bt_line[PTP_UI_LINE_MAX];
         bool rec_on;
     };
 } ui_msg_t;
@@ -49,10 +53,17 @@ static rs3_lcd_info_t s_lcd;
 static rs3_wifi_sta_status_t s_last_wifi;
 static rs3_tcp_server_status_t s_last_tcp;
 static bool s_has_tcp = false;
-static rs3_ota_status_t s_last_ota = { .state = RS3_OTA_STATE_IDLE, .last_err = ESP_OK };
+static rs3_ota_status_t s_last_ota = {
+    .state = RS3_OTA_STATE_IDLE,
+    .last_err = ESP_OK,
+    .bytes_read = 0,
+    .total_bytes = -1,
+    .progress_pct = -1,
+};
 static bool s_has_ota = true;
 static char s_ptp_impl[PTP_UI_LINE_MAX] = {0};
 static char s_ptp_status[PTP_UI_LINE_MAX] = {0};
+static char s_bt_status[PTP_UI_LINE_MAX] = {0};
 static bool s_rec_on = false;
 static bool s_has_rec = false;
 
@@ -64,6 +75,8 @@ typedef struct {
 
 static ui_btn_t s_btn_ota = { .x = 0, .y = 0, .w = 0, .h = 36, .label = "Update FW" };
 static ui_btn_t s_btn_rst = { .x = 0, .y = 0, .w = 0, .h = 36, .label = "Restart MCU" };
+static ui_btn_t s_btn_pair = { .x = 0, .y = 0, .w = 0, .h = 36, .label = "Pair Nikon" };
+static ui_btn_t s_btn_shut = { .x = 0, .y = 0, .w = 0, .h = 36, .label = "Shutter" };
 
 static bool s_touch_prev = false;
 
@@ -134,6 +147,7 @@ static void render_all(void)
     char line2[64] = {0};
     char line3[64] = {0};
     char line4[64] = {0};
+    char line_bt[64] = {0};
 
     switch (s_last_wifi.state) {
         case RS3_WIFI_STA_STATE_DISABLED:
@@ -170,7 +184,21 @@ static void render_all(void)
             case RS3_OTA_STATE_FAILED: ota_s = "fail"; break;
             default: break;
         }
-        snprintf(line4, sizeof(line4), "OTA: %s", ota_s);
+        if (s_last_ota.state == RS3_OTA_STATE_RUNNING) {
+            if (s_last_ota.progress_pct >= 0) {
+                snprintf(line4, sizeof(line4), "OTA: %s %d%%", ota_s, (int)s_last_ota.progress_pct);
+            } else if (s_last_ota.bytes_read > 0) {
+                snprintf(line4, sizeof(line4), "OTA: %s %ld", ota_s, (long)s_last_ota.bytes_read);
+            } else {
+                snprintf(line4, sizeof(line4), "OTA: %s", ota_s);
+            }
+        } else {
+            snprintf(line4, sizeof(line4), "OTA: %s", ota_s);
+        }
+    }
+
+    if (s_bt_status[0]) {
+        snprintf(line_bt, sizeof(line_bt), "%s", s_bt_status);
     }
 
     const int x = 10;
@@ -178,9 +206,10 @@ static void render_all(void)
     const int y2 = y1 + (7 + 2) * scale;
     const int y3 = y2 + (7 + 2) * scale;
     const int y4 = y3 + (7 + 2) * scale;
-    const int y5 = y4 + (7 + 4) * scale;
-    const int y6 = y5 + (7 + 2) * scale;
+    const int y5 = y4 + (7 + 2) * scale;
+    const int y6 = y5 + (7 + 4) * scale;
     const int y7 = y6 + (7 + 2) * scale;
+    const int y8 = y7 + (7 + 2) * scale;
     rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y1, line1, WHITE, BLACK, scale);
     if (strlen(line2)) {
         rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y2, line2, WHITE, BLACK, scale);
@@ -191,25 +220,30 @@ static void render_all(void)
     if (strlen(line4)) {
         rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y4, line4, WHITE, BLACK, scale);
     }
+    if (strlen(line_bt)) {
+        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y5, line_bt, WHITE, BLACK, scale);
+    }
 
     // USB/PTP impl + current status (no history)
     if (s_ptp_impl[0]) {
         char ptp_impl_line[48];
         snprintf(ptp_impl_line, sizeof(ptp_impl_line), "PTP impl: %s", s_ptp_impl);
-        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y5, ptp_impl_line, WHITE, BLACK, scale);
+        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y6, ptp_impl_line, WHITE, BLACK, scale);
     }
     if (s_has_rec) {
         char rec_line[48];
         snprintf(rec_line, sizeof(rec_line), "REC: %s", s_rec_on ? "ON" : "OFF");
-        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y6, rec_line, WHITE, BLACK, scale);
+        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, y7, rec_line, WHITE, BLACK, scale);
     }
     if (s_ptp_status[0]) {
         char ptp_line[48];
         snprintf(ptp_line, sizeof(ptp_line), "PTP: %s", s_ptp_status);
-        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, s_has_rec ? y7 : y6, ptp_line, WHITE, BLACK, scale);
+        rs3_draw_text_5x7(s_fb, s_lcd.w, s_lcd.h, x, s_has_rec ? y8 : y7, ptp_line, WHITE, BLACK, scale);
     }
 
     // Touch buttons
+    draw_button(&s_btn_pair);
+    draw_button(&s_btn_shut);
     draw_button(&s_btn_ota);
     draw_button(&s_btn_rst);
 
@@ -251,6 +285,9 @@ static void ui_task(void *arg)
                     s_rec_on = msg.rec_on;
                     s_has_rec = true;
                     break;
+                case UI_MSG_BT_LINE:
+                    snprintf(s_bt_status, sizeof(s_bt_status), "%s", msg.bt_line);
+                    break;
                 default:
                     break;
             }
@@ -261,7 +298,15 @@ static void ui_task(void *arg)
         bool t = rs3_touch_get_point(&tx, &ty);
         if (t && !s_touch_prev) {
             // Rising edge = click
-            if (btn_hit(&s_btn_ota, tx, ty)) {
+            if (btn_hit(&s_btn_pair, tx, ty)) {
+                rs3_tcp_logf("[UI] Pair Nikon pressed x=%d y=%d\r\n", tx, ty);
+                (void)rs3_ui_status_bt_line("BT: pair pressed");
+                (void)rs3_nikon_bt_pair_start();
+            } else if (btn_hit(&s_btn_shut, tx, ty)) {
+                rs3_tcp_logf("[UI] Shutter pressed x=%d y=%d\r\n", tx, ty);
+                (void)rs3_ui_status_bt_line("BT: shutter pressed");
+                (void)rs3_nikon_bt_shutter_click();
+            } else if (btn_hit(&s_btn_ota, tx, ty)) {
                 // Fixed URL as requested
                 (void)rs3_ota_start("http://192.168.1.246:8000/rs3proxy_hello.bin");
             } else if (btn_hit(&s_btn_rst, tx, ty)) {
@@ -281,17 +326,28 @@ esp_err_t rs3_ui_status_start(void)
     s_lcd = rs3_lcd_get_info();
 
     // Layout buttons at the bottom (after we know display height).
-    // One row: [ Update FW ] [ Restart MCU ]
-    const int row_y = s_lcd.h - s_btn_ota.h - UI_BTN_GAP_Y;
+    // Two rows:
+    //   row 1: [ Pair Nikon ] [ Shutter ]
+    //   row 2: [ Update FW ] [ Restart MCU ]
+    const int row2_y = s_lcd.h - s_btn_ota.h - UI_BTN_GAP_Y;
+    const int row1_y = row2_y - s_btn_pair.h - UI_BTN_GAP_Y;
     const int avail_w = s_lcd.w - 2 * UI_BTN_MARGIN_X;
     const int btn_w = (avail_w - UI_BTN_GAP_X) / 2;
 
+    s_btn_pair.x = UI_BTN_MARGIN_X;
+    s_btn_pair.y = row1_y;
+    s_btn_pair.w = btn_w;
+
+    s_btn_shut.x = UI_BTN_MARGIN_X + btn_w + UI_BTN_GAP_X;
+    s_btn_shut.y = row1_y;
+    s_btn_shut.w = btn_w;
+
     s_btn_ota.x = UI_BTN_MARGIN_X;
-    s_btn_ota.y = row_y;
+    s_btn_ota.y = row2_y;
     s_btn_ota.w = btn_w;
 
     s_btn_rst.x = UI_BTN_MARGIN_X + btn_w + UI_BTN_GAP_X;
-    s_btn_rst.y = row_y;
+    s_btn_rst.y = row2_y;
     s_btn_rst.w = btn_w;
 
     s_fb = heap_caps_malloc(s_lcd.w * s_lcd.h * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -375,6 +431,15 @@ esp_err_t rs3_ui_status_ptp_impl(const char *impl)
     if (!s_q || !impl) return ESP_ERR_INVALID_STATE;
     ui_msg_t msg = { .kind = UI_MSG_PTP_IMPL };
     snprintf(msg.ptp_impl, sizeof(msg.ptp_impl), "%s", impl);
+    (void)xQueueSend(s_q, &msg, 0);
+    return ESP_OK;
+}
+
+esp_err_t rs3_ui_status_bt_line(const char *line)
+{
+    if (!s_q || !line) return ESP_ERR_INVALID_STATE;
+    ui_msg_t msg = { .kind = UI_MSG_BT_LINE };
+    snprintf(msg.bt_line, sizeof(msg.bt_line), "%s", line);
     (void)xQueueSend(s_q, &msg, 0);
     return ESP_OK;
 }
