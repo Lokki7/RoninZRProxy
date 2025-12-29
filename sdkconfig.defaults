@@ -1,0 +1,17 @@
+# Keep this file minimal; prefer configuring via `idf.py menuconfig`.
+#
+# If you want the serial output to be reliably visible without extra settings,
+# configure it via menuconfig (Component config → ESP System Settings → Channel for console output).
+
+# Use custom partition table with OTA slots.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Board has 16MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
+
+# Leave optimization to menuconfig (defaults are fine on 16MB flash).
+
+

@@ -1,0 +1,50 @@
+# ESP-IDF / CMake
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.old.*
+
+# ESP-IDF component manager
+managed_components/
+
+# Flash / firmware artifacts (in case they end up outside build/)
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+
+# Logs / dumps
+*.log
+*.pcap
+*.pcapng
+*.dump
+*.trace
+
+# IDE
+.vscode/
+.idea/
+.fleet/
+.project
+.cproject
+.settings/
+
+# Editor temp files
+*~
+*.swp
+*.swo
+*.tmp
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+

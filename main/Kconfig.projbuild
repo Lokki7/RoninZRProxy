@@ -1,0 +1,137 @@
+menu "rs3proxy"
+
+    menu "Wi-Fi"
+
+        config RS3_WIFI_ENABLE
+            bool "Enable Wi-Fi (STA)"
+            default y
+
+        config RS3_WIFI_SSID
+            string "Wi-Fi SSID"
+            default ""
+            help
+                SSID of the Wi-Fi network to connect to at boot.
+
+        config RS3_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default ""
+            help
+                Wi-Fi password (WPA/WPA2/WPA3-Personal). Leave empty for open networks.
+
+        config RS3_WIFI_MAXIMUM_RETRY
+            int "Maximum reconnect retries"
+            default 10
+            range 0 100
+            help
+                How many times to retry connecting before giving up. 0 means retry forever.
+
+    endmenu
+
+    menu "TCP server"
+
+        config RS3_TCP_SERVER_ENABLE
+            bool "Enable TCP server"
+            default y
+
+        config RS3_TCP_SERVER_PORT
+            int "Listen port"
+            default 1234
+            range 1 65535
+
+    endmenu
+
+    menu "OTA update"
+
+        config RS3_OTA_ENABLE
+            bool "Enable OTA (HTTP/HTTPS pull)"
+            default y
+
+        config RS3_OTA_URL
+            string "Default firmware URL"
+            default ""
+            help
+                URL to a .bin firmware image (e.g. http://PC-IP:8000/rs3proxy_hello.bin).
+                You can also trigger OTA over TCP by sending: ota <url>
+
+    endmenu
+
+    menu "USB PTP (camera emulation)"
+
+        config RS3_USB_PTP_ENABLE
+            bool "Enable USB PTP device (camera emulation)"
+            default n
+            help
+                Enables USB device mode and exposes a Still Image (PTP) interface.
+                Use TCP logs for debugging (USB is occupied).
+
+        config RS3_USB_PTP_VID
+            hex "USB VID"
+            default 0x054C
+            depends on RS3_USB_PTP_ENABLE
+            help
+                Sony Corporation VID is 0x054C.
+
+        config RS3_USB_PTP_PID
+            hex "USB PID"
+            default 0x0000
+            depends on RS3_USB_PTP_ENABLE
+            help
+                Set this to the PID matching the device you want to emulate (e.g. FX30).
+
+        config RS3_USB_PTP_BCD_DEVICE
+            hex "USB bcdDevice"
+            default 0x0100
+            depends on RS3_USB_PTP_ENABLE
+            help
+                Device release number (bcdDevice) exposed in the USB device descriptor.
+                If you want to mimic a real camera closer, copy its bcdDevice (e.g. 0x0300).
+
+        config RS3_USB_PTP_MANUFACTURER
+            string "USB Manufacturer string"
+            default "Sony Corporation"
+            depends on RS3_USB_PTP_ENABLE
+
+        config RS3_USB_PTP_PRODUCT
+            string "USB Product string"
+            default "ILME-FX30"
+            depends on RS3_USB_PTP_ENABLE
+
+        config RS3_USB_PTP_SERIAL
+            string "USB Serial string"
+            default "00000001"
+            depends on RS3_USB_PTP_ENABLE
+
+        choice RS3_USB_PTP_IMPL
+            prompt "PTP implementation"
+            default RS3_USB_PTP_IMPL_STD
+            depends on RS3_USB_PTP_ENABLE
+            help
+                Select which PTP emulation implementation to build:
+                - Standard: strict PTP container layout (length/type/code/tid), intended for PC hosts.
+                - Legacy (RS3): includes non-standard DJI/RS3 quirks to match picky hosts.
+                - Raw proxy: do not emulate; forward raw USB bulk packets to a PC over TCP.
+
+            config RS3_USB_PTP_IMPL_STD
+                bool "Standard PTP (OpenSession + GetDeviceInfo)"
+
+            config RS3_USB_PTP_IMPL_LEGACY
+                bool "Legacy RS3/DJI quirks (current implementation)"
+
+            config RS3_USB_PTP_IMPL_PROXY_RAW
+                bool "Raw proxy (USB bulk <-> TCP, no modifications)"
+        endchoice
+
+        config RS3_USB_PTP_PROXY_PORT
+            int "PTP proxy TCP port (separate from logs/OTA)"
+            default 1235
+            range 1 65535
+            depends on RS3_USB_PTP_ENABLE && RS3_USB_PTP_IMPL_PROXY_RAW
+            help
+                TCP port used only for the PTP proxy binary protocol. Keep it different from
+                CONFIG_RS3_TCP_SERVER_PORT (used for logs and OTA commands).
+
+    endmenu
+
+endmenu
+
+

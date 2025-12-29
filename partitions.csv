@@ -1,0 +1,17 @@
+# Name,   Type, SubType, Offset,  Size
+# Notes:
+# - Designed for 16MB flash (0x1000000) on Waveshare ESP32-S3-Touch-LCD-1.83
+# - OTA uses two slots (ota_0/ota_1) + otadata
+
+nvs,      data, nvs,     0x9000,   0x6000
+otadata,  data, ota,     0xF000,   0x2000
+phy_init, data, phy,     0x11000,  0x1000
+
+# Two generous OTA slots (6MB each)
+ota_0,    app,  ota_0,   0x20000,  0x600000
+ota_1,    app,  ota_1,   0x620000, 0x600000
+
+# Optional storage (SPIFFS) in remaining space (~3.875MB)
+spiffs,   data, spiffs,  0xC20000, 0x3E0000
+
+
