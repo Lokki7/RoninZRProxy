@@ -1,5 +1,7 @@
 ## rs3proxy (ESP-IDF, ESP32‑S3)
 
+> **Disclaimer:** This project’s code was written entirely using **GPT-5.2**.
+
 Project for researching and controlling a camera via **DJI RS3** over **USB PTP**:
 
 - **PTP emulation on ESP32** (a “Sony-like” camera so RS3 accepts the device).
