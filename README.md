@@ -1,39 +1,39 @@
 ## rs3proxy (ESP-IDF, ESP32‑S3)
 
-Проект для исследования и управления камерой через **DJI RS3** по **USB PTP**:
+Project for researching and controlling a camera via **DJI RS3** over **USB PTP**:
 
-- **PTP эмуляция на ESP32** (камера “как Sony”, чтобы RS3 принял устройство).
-- **Raw proxy режим**: ESP32 как USB‑устройство для RS3 и TCP‑мост на ПК (для sniff/relay).
-- **TCP сервер** для логов и команд (в т.ч. OTA и reboot).
-- **UI на LCD + touch**: статус и кнопки “Update FW” / “Restart MCU”.
+- **PTP emulation on ESP32** (a “Sony-like” camera so RS3 accepts the device).
+- **Raw proxy mode**: ESP32 as a USB device for RS3 plus a TCP bridge to a PC (for sniff/relay).
+- **TCP server** for logs and commands (incl. OTA and reboot).
+- **LCD + touch UI**: status and “Update FW” / “Restart MCU” buttons.
 
-Плата: **Waveshare ESP32-S3-Touch-LCD-1.83**. Полезный гайд Waveshare: [ESP32-S3-Touch-LCD-1.83 — Run the First ESP-IDF Demo](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-1.83#Run_the_First_ESP-IDF_Demo)
+Board: **Waveshare ESP32-S3-Touch-LCD-1.83**. Handy Waveshare guide: [ESP32-S3-Touch-LCD-1.83 — Run the First ESP-IDF Demo](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-1.83#Run_the_First_ESP-IDF_Demo)
 
-### Порты / подключение
+### Ports / connectivity
 
-- **TCP logs + commands**: `CONFIG_RS3_TCP_SERVER_PORT` (по умолчанию **1234**)  
-  Подключение: `nc <esp-ip> 1234`
-- **PTP raw proxy** (USB bulk <-> TCP бинарный протокол): `CONFIG_RS3_USB_PTP_PROXY_PORT` (по умолчанию **1235**)  
-  Используется скриптом `scripts/rs3_ptp_raw_proxy.py` (и/или `scripts/rs3_ptp_proxy.py`).
+- **TCP logs + commands**: `CONFIG_RS3_TCP_SERVER_PORT` (default **1234**)  
+  Connect: `nc <esp-ip> 1234`
+- **PTP raw proxy** (USB bulk <-> TCP binary protocol): `CONFIG_RS3_USB_PTP_PROXY_PORT` (default **1235**)  
+  Used by `scripts/rs3_ptp_raw_proxy.py` (and/or `scripts/rs3_ptp_proxy.py`).
 
-### Конфигурация (menuconfig)
+### Configuration (menuconfig)
 
-Все ключевые настройки в `main/Kconfig.projbuild`:
+All key settings are in `main/Kconfig.projbuild`:
 
-- **Wi‑Fi (STA)**: SSID/password для подключения и получения IP
-- **TCP server**: порт логов/команд (по умолчанию 1234)
-- **OTA**: `CONFIG_RS3_OTA_URL` (default URL для кнопки “Update FW” и команды `ota <url>`)
+- **Wi‑Fi (STA)**: SSID/password to connect and obtain an IP
+- **TCP server**: logs/commands port (default 1234)
+- **OTA**: `CONFIG_RS3_OTA_URL` (default URL for the “Update FW” button and the `ota <url>` command)
 - **USB PTP (camera emulation)**:
   - `CONFIG_RS3_USB_PTP_ENABLE`
-  - VID/PID/bcdDevice/строки (чтобы совпадать с реальной камерой)
+  - VID/PID/bcdDevice/strings (to match a real camera)
   - **PTP implementation**:
-    - **Standard** (`RS3_USB_PTP_IMPL_STD`): базовая реализация для PC‑host
-    - **Legacy (RS3)** (`RS3_USB_PTP_IMPL_LEGACY`): текущая реализация под RS3
-    - **Raw proxy** (`RS3_USB_PTP_IMPL_PROXY_RAW`): мост USB bulk <-> TCP без модификаций
+    - **Standard** (`RS3_USB_PTP_IMPL_STD`): basic implementation for PC-host
+    - **Legacy (RS3)** (`RS3_USB_PTP_IMPL_LEGACY`): current implementation for RS3
+    - **Raw proxy** (`RS3_USB_PTP_IMPL_PROXY_RAW`): USB bulk <-> TCP bridge without modifications
 
-### Сборка
+### Build
 
-В корне проекта:
+In the project root:
 
 ```bash
 idf.py set-target esp32s3
@@ -41,63 +41,64 @@ idf.py menuconfig
 idf.py build
 ```
 
-Если ты используешь ESP‑IDF из установленного пути, обычно достаточно:
+If you're using ESP-IDF from an installed path, typically this is enough:
 
 ```bash
-source /Users/pavel/esp/esp-idf/export.sh
+source ~/esp/esp-idf/export.sh
 export IDF_COMPONENT_MANAGER=1
-cd /Users/pavel/workspace/rs3proxy
+cd /path/to/rs3proxy
 idf.py build
 ```
 
-### Прошивка и монитор
+### Flash and monitor
 
-Прошивку/монитор запускай как тебе удобно (COM/tty зависит от системы):
+Run flashing/monitoring however you prefer (COM/tty depends on your system):
 
 ```bash
 idf.py -p /dev/ttyACM0 flash
 idf.py -p /dev/ttyACM0 monitor
 ```
 
-### Логи и команды по TCP
+### TCP logs and commands
 
-Подключиться к логам:
+Connect to logs:
 
 ```bash
 nc <esp-ip> 1234
 ```
 
-Команды (TCP):
+Commands (TCP):
 
-- `ota <url>`: pull‑OTA обновление (см. `CONFIG_RS3_OTA_URL`)
-- `reboot` / `restart` / `reset`: перезагрузка MCU
+- `ota <url>`: pull-OTA update (see `CONFIG_RS3_OTA_URL`)
+- `pair`: start Nikon Bluetooth pairing (same as the touch button)
+- `shutter`: do a Bluetooth “shutter click” (same as the touch button)
+- `reboot` / `restart` / `reset`: reboot the MCU
 
 ### PTP debug logging
 
-В прошивке есть compile‑time флаг:
+Firmware has a compile-time flag:
 
-- `RS3_PTP_LOG_DEBUG=0` (по умолчанию): тихо/минимально
-- `RS3_PTP_LOG_DEBUG=1`: подробные логи (для диагностики USB/PTP)
+- `RS3_PTP_LOG_DEBUG=0` (default): quiet/minimal
+- `RS3_PTP_LOG_DEBUG=1`: verbose logs (for USB/PTP debugging)
 
-### Touch кнопки (LCD)
+### Touch buttons (LCD)
 
-Внизу экрана две кнопки:
+There are two buttons at the bottom of the screen:
 
-- **Update FW**: запускает OTA с URL из `CONFIG_RS3_OTA_URL`
-- **Restart MCU**: вызывает `esp_restart()`
+- **Update FW**: starts OTA using the URL from `CONFIG_RS3_OTA_URL`
+- **Restart MCU**: calls `esp_restart()`
 
-### Скрипты (macOS / USB PTP)
+### Scripts (macOS / USB PTP)
 
-См. `scripts/README.md`:
+See `scripts/README.md`:
 
-- `scripts/usb_dump_ptp_enumeration.py`: снять VID/PID/bcdDevice/строки и endpoint‑ы с реальной камеры
-- `scripts/ptp_getdeviceinfo.py`: получить сырые байты DeviceInfo
-- `scripts/rs3_ptp_raw_proxy.py`: raw proxy (для режима `RS3_USB_PTP_IMPL_PROXY_RAW`)
+- `scripts/usb_dump_ptp_enumeration.py`: dump VID/PID/bcdDevice/strings and endpoints from a real camera
+- `scripts/ptp_getdeviceinfo.py`: get raw DeviceInfo bytes
+- `scripts/rs3_ptp_raw_proxy.py`: raw proxy (for `RS3_USB_PTP_IMPL_PROXY_RAW` mode)
 
-На macOS часто нужно:
+On macOS you often need:
 
 ```bash
 sudo killall PTPCamera 2>/dev/null || true
 ```
-
 
